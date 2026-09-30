@@ -30,33 +30,115 @@
   <div id="jspsych-target"></div>
 
   <script>
+    // ------------------------------------------------------------------ settings
+    var MAX_ATTEMPTS = 3;        // calibrate up to this many times ...
+    var THRESHOLD = 0.08;        // ... until accuracy (RMSE / window diagonal) is at or below this
+
+    // Accuracy check: same dots and procedure for the check after calibration and the
+    // post-video drift check ("validate" message from the survey page).
+    var CHECK_POINTS = [
+      { x: 0.3, y: 0.3 }, { x: 0.7, y: 0.3 }, { x: 0.5, y: 0.5 }, { x: 0.3, y: 0.7 }, { x: 0.7, y: 0.7 }
+    ];
+    var SETTLE_MS = 1000;        // time to move the eyes to the dot before measuring
+    var COLLECT_MS = 1000;       // time over which gaze is collected per dot
+    var MIN_SAMPLES = 3;         // valid samples needed per dot
+
+    var isInIframe = window.parent !== window;
     var calibration_attempts = 0;
     var final_validation_data = null;
+    var is_tracking_available = false;
     var adapter = new GazeAdapter();
 
+    // All gaze samples go through here, so several consumers can listen at once.
+    var sampleHandlers = [];
+    adapter.onSample(function (sample) {
+      sampleHandlers.forEach(function (h) { h(sample); });
+    });
+
+    // With no face (or closed eyes) in view the tracker returns the exact window centre.
+    function isNoFace(s) {
+      return Math.abs(s.x - window.innerWidth / 2) < 0.01 && Math.abs(s.y - window.innerHeight / 2) < 0.01;
+    }
+
+    function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+    function median(a) {
+      var s = a.slice().sort(function (p, q) { return p - q; });
+      return s[Math.floor(s.length / 2)];
+    }
+
+    // Shows CHECK_POINTS one after another (no clicks, so the model is not changed) and
+    // measures the distance between the median gaze and each dot.
+    async function measureAccuracy() {
+      var overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:9999;' +
+        'background:rgba(0,0,0,0.5);cursor:none;';
+      var dot = document.createElement('div');
+      dot.style.cssText = 'position:absolute;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;' +
+        'background:#1e6fff;border:3px solid #fff;box-sizing:border-box;transition:all 0.4s;';
+      overlay.appendChild(dot);
+      document.body.appendChild(overlay);
+
+      var buffer = null;
+      var handler = function (s) { if (buffer) buffer.push(s); };
+      sampleHandlers.push(handler);
+
+      var errors = [], nValid = [];
+      for (var i = 0; i < CHECK_POINTS.length; i++) {
+        var p = CHECK_POINTS[i];
+        dot.style.left = (p.x * 100) + '%';
+        dot.style.top = (p.y * 100) + '%';
+        await wait(SETTLE_MS);
+        buffer = [];
+        await wait(COLLECT_MS);
+        var valid = buffer.filter(function (s) { return !isNoFace(s); });
+        buffer = null;
+        nValid.push(valid.length);
+        if (valid.length >= MIN_SAMPLES) {
+          var dx = median(valid.map(function (s) { return s.x; })) - p.x * window.innerWidth;
+          var dy = median(valid.map(function (s) { return s.y; })) - p.y * window.innerHeight;
+          errors.push(Math.round(Math.sqrt(dx * dx + dy * dy)));
+        } else {
+          errors.push(null);                    // no face / too few samples at this dot
+        }
+      }
+
+      sampleHandlers.splice(sampleHandlers.indexOf(handler), 1);
+      document.body.removeChild(overlay);
+
+      var measured = errors.filter(function (e) { return e !== null; });
+      var diag = Math.sqrt(window.innerWidth * window.innerWidth + window.innerHeight * window.innerHeight);
+      var rmsePx = measured.length >= 3
+        ? Math.sqrt(measured.reduce(function (a, e) { return a + e * e; }, 0) / measured.length)
+        : null;
+      return {
+        rmse: rmsePx === null ? null : rmsePx / diag,
+        rmse_pixels: rmsePx === null ? null : Math.round(rmsePx),
+        errors: errors,
+        n_samples: nValid,
+        validation_points: CHECK_POINTS.length,
+        measured_points: measured.length,
+        window_w: window.innerWidth,
+        window_h: window.innerHeight
+      };
+    }
+
     var jsPsych = initJsPsych({
-      on_finish: function (data) {
+      on_finish: function () {
         var validation_data = final_validation_data;
-
-        console.log('Calibration complete!');
-        console.log('Validation data:', validation_data);
-
-        var offset_text = validation_data && validation_data.rmse !== undefined
-          ? validation_data.rmse.toFixed(2) + ' (RMSE)'
+        var offset_text = validation_data && validation_data.rmse !== null
+          ? validation_data.rmse.toFixed(3) + ' (RMSE)'
           : 'Not available';
-
         document.querySelector('#jspsych-target').innerHTML =
           '<div style="text-align: center; padding: 50px; font-family: sans-serif;">' +
           '<h2>Calibration Complete!</h2>' +
           '<p>Accuracy: ' + offset_text + '</p>' +
           '<p>Calibration attempts: ' + calibration_attempts + '</p>' +
-          '<p style="color: #666; font-size: 14px;">Check console for full data</p>' +
           '</div>';
       }
     });
 
     var timeline = [];
-    var is_tracking_available = false;
 
     timeline.push({
       type: jsPsychHtmlButtonResponse,
@@ -90,104 +172,98 @@
         }
 
         if (continueBtn) continueBtn.disabled = false;
-      },
-      on_finish: function () {
-        const elem = document.documentElement;
-        if (elem.requestFullscreen) {
-          elem.requestFullscreen().catch(err => {
-            console.warn('[Calibration] Could not enter fullscreen:', err.message);
-          });
-        } else if (elem.webkitRequestFullscreen) {
-          elem.webkitRequestFullscreen();
-        } else if (elem.msRequestFullscreen) {
-          elem.msRequestFullscreen();
-        }
       }
     });
 
-    function create_calibration_sequence() {
-      var sequence = [];
+    var setup_instructions = {
+      type: jsPsychHtmlButtonResponse,
+      stimulus: `
+        <div style="text-align: center; padding: 20px; max-width: 640px; margin: 0 auto;">
+          <h3>Before we start</h3>
+          <p>Eye tracking with a webcam only works well if your head stays in the same place.
+             Please set up now and keep this position until the end of the video:</p>
+          <ul style="text-align: left; margin: 20px auto; display: inline-block; line-height: 1.6;">
+            <li><strong>Light on your face</strong> - no bright window or lamp behind you</li>
+            <li>Sit about an arm's length from the screen, <strong>face centered</strong> in front of the camera</li>
+            <li><strong>Keep your head still</strong> - move only your eyes; don't lean in or back</li>
+            <li>Maximize this browser window and <strong>stay on this tab</strong> until the video has ended</li>
+            <li>Glasses are fine; please avoid covering your face with your hands</li>
+          </ul>
+        </div>
+      `,
+      choices: ['I am ready']
+    };
+    timeline.push({ timeline: [setup_instructions], conditional_function: function () { return is_tracking_available; } });
 
-      sequence.push({
-        type: jsPsychHtmlButtonResponse,
-        stimulus: `
-          <div style="text-align: center; padding: 20px; max-width: 600px; margin: 0 auto;">
-            <h3>Calibration Instructions</h3>
-            <p>Dots will appear at different positions on your screen.</p>
-            <p><strong>Please:</strong></p>
-            <ul style="text-align: left; margin: 20px auto; display: inline-block;">
-              <li>Look directly at each dot until it disappears</li>
-              <li>Use your eyes to look at the dots, not your head</li>
-              <li>Stay centered and keep good lighting</li>
-              <li>Sit at a comfortable distance from the screen</li>
-            </ul>
-            <p style="color: #666; font-size: 14px; margin-top: 20px;">
-              The calibration takes about 30 seconds.
+    var calibration_instructions = {
+      type: jsPsychHtmlButtonResponse,
+      stimulus: `
+        <div style="text-align: center; padding: 20px; max-width: 600px; margin: 0 auto;">
+          <h3>Calibration Instructions</h3>
+          <p>Dots will appear at different positions on your screen.</p>
+          <p><strong>Please:</strong></p>
+          <ul style="text-align: left; margin: 20px auto; display: inline-block;">
+            <li>Look directly at each dot until it moves on</li>
+            <li>Use your eyes to look at the dots, not your head</li>
+            <li>Green dots calibrate, blue dots then check the accuracy</li>
+          </ul>
+          <p style="color: #666; font-size: 14px; margin-top: 20px;">
+            This takes about 30 seconds.
+          </p>
+        </div>
+      `,
+      choices: ['Begin Calibration']
+    };
+
+    var retry_message = {
+      type: jsPsychHtmlButtonResponse,
+      stimulus: function () {
+        return `
+          <div style="text-align: center; padding: 50px 40px; max-width: 600px; margin: 0 auto;">
+            <p style="font-size: 1.1rem; color: #333; line-height: 1.6;">
+              The eye tracking is not accurate enough yet.
             </p>
-          </div>
-        `,
-        choices: ['Begin Calibration']
-      });
+            <p style="color: #555; line-height: 1.6;">
+              Please check that your face is well lit and centered, keep your head still,
+              and follow each dot with your eyes. Let's try again
+              (attempt ${calibration_attempts + 1} of ${MAX_ATTEMPTS}).
+            </p>
+          </div>`;
+      },
+      choices: ['Try again']
+    };
 
-      sequence.push({
-        type: jsPsychCallFunction,
-        async: true,
-        func: async function (done) {
-          try {
-            const result = await adapter.calibrate();
-            calibration_attempts++;
-            final_validation_data = result;
-            done();
-          } catch (e) {
-            console.error('Calibration failed:', e);
-            done();
-          }
+    var calibrate = {
+      type: jsPsychCallFunction,
+      async: true,
+      func: async function (done) {
+        try {
+          await adapter.calibrate();                 // green dots (model) + its own quick check
+          calibration_attempts++;
+          final_validation_data = await measureAccuracy();   // blue dots, measured as in the post-video check
+        } catch (e) {
+          console.error('Calibration failed:', e);
         }
-      });
-
-      return {
-        timeline: sequence,
-        conditional_function: function () {
-          return is_tracking_available;
-        }
-      };
-    }
-
-    timeline.push(create_calibration_sequence());
-
-    var auto_retry = {
-      timeline: [
-        {
-          type: jsPsychHtmlButtonResponse,
-          stimulus: `
-            <div style="text-align: center; padding: 60px 40px; max-width: 600px; margin: 0 auto;">
-              <p style="font-size: 1.1rem; color: #333; line-height: 1.6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-                It seems like you might have looked away.
-              </p>
-              <p style="font-size: 1rem; color: #666; margin-top: 16px;">
-                Let's try again...
-              </p>
-            </div>
-          `,
-          choices: [],
-          trial_duration: 2000
-        },
-        create_calibration_sequence()
-      ],
-      conditional_function: function () {
-        if (!is_tracking_available) return false;
-
-        var threshold = 0.08;
-        var rmse = final_validation_data ? final_validation_data.rmse : null;
-
-        if (calibration_attempts === 1 && rmse !== null && rmse > threshold) {
-          return true;
-        }
-
-        return false;
+        done();
       }
     };
-    timeline.push(auto_retry);
+
+    function calibrationGood() {
+      var r = final_validation_data && final_validation_data.rmse;
+      return r !== null && r !== undefined && r <= THRESHOLD;
+    }
+
+    timeline.push({
+      timeline: [
+        { timeline: [retry_message], conditional_function: function () { return calibration_attempts > 0; } },
+        { timeline: [calibration_instructions], conditional_function: function () { return calibration_attempts === 0; } },
+        calibrate
+      ],
+      conditional_function: function () { return is_tracking_available; },
+      loop_function: function () {
+        return is_tracking_available && calibration_attempts < MAX_ATTEMPTS && !calibrationGood();
+      }
+    });
 
     timeline.push({
       type: jsPsychHtmlButtonResponse,
@@ -209,15 +285,15 @@
           }
         }
 
-        if (window.parent !== window) {
-          var model_key = 'webeyetrack_model_' + Date.now();
+        if (isInIframe) {
           window.parent.postMessage({
             type: 'calibration-complete',
             average_offset: final_validation_data ? final_validation_data.rmse : null,
             recalibrated: calibration_attempts > 1,
             calibration_attempts: calibration_attempts,
+            calibration_good: calibrationGood(),
             validation_data: final_validation_data,
-            model_key: model_key,
+            model_key: 'webeyetrack_model_' + Date.now(),
             tracking_available: is_tracking_available
           }, '*');
         }
@@ -225,8 +301,6 @@
         done();
       }
     });
-
-    const isInIframe = window.parent !== window;
 
     if (isInIframe) {
       timeline.push({
@@ -249,7 +323,6 @@
             <h2 style="color: #2ecc71;">Eye Tracking Active</h2>
             <p style="margin: 20px 0;">Calibration complete and tracker is running.</p>
             <p style="color: #666; font-size: 14px;">In Qualtrics, this iframe would remain hidden while tracking continues.</p>
-            <p style="color: #666; font-size: 14px; margin-top: 30px;">You can close this window now or click the button below.</p>
           </div>
         `,
         choices: ['Close Window']
@@ -259,77 +332,62 @@
     jsPsych.run(timeline);
 
     var isTracking = false;
-    var gazeBuffer = [];
     var viewportOffset = { scrollX: 0, scrollY: 0 };
-    var sampleCount = 0;
 
     function initTrackingMode() {
       isTracking = true;
 
-      const gazeDot = document.createElement('div');
-      gazeDot.id = 'gaze-dot';
-      gazeDot.style.position = 'fixed';
-      gazeDot.style.width = '20px';
-      gazeDot.style.height = '20px';
-      gazeDot.style.backgroundColor = 'red';
-      gazeDot.style.borderRadius = '50%';
-      gazeDot.style.pointerEvents = 'none';
-      gazeDot.style.zIndex = '9999';
-      gazeDot.style.transform = 'translate(-50%, -50%)';
-      gazeDot.style.display = 'none';
-      document.body.appendChild(gazeDot);
+      // Red gaze dot only when this page is opened on its own (in the survey it would be
+      // visible during the post-video accuracy check and give feedback).
+      var gazeDot = null;
+      if (!isInIframe) {
+        gazeDot = document.createElement('div');
+        gazeDot.style.cssText = 'position:fixed;width:20px;height:20px;background:red;border-radius:50%;' +
+          'pointer-events:none;z-index:9999;transform:translate(-50%,-50%);display:none;';
+        document.body.appendChild(gazeDot);
+      }
 
-      adapter.onSample((sample) => {
-        sampleCount++;
-
-        gazeDot.style.display = 'block';
-        gazeDot.style.left = sample.x + 'px';
-        gazeDot.style.top = sample.y + 'px';
-
-        if (!isTracking) return;
-
-        if (window.parent !== window) {
-          window.parent.postMessage({
-            type: 'gaze-data',
-            timestamp: sample.perf_t,
-            x: sample.x + viewportOffset.scrollX,
-            y: sample.y + viewportOffset.scrollY
-          }, '*');
+      sampleHandlers.push(function (sample) {
+        if (gazeDot) {
+          gazeDot.style.display = 'block';
+          gazeDot.style.left = sample.x + 'px';
+          gazeDot.style.top = sample.y + 'px';
         }
-
-        gazeBuffer.push({
+        if (!isTracking || !isInIframe) return;
+        window.parent.postMessage({
+          type: 'gaze-data',
           timestamp: sample.perf_t,
           x: sample.x + viewportOffset.scrollX,
-          y: sample.y + viewportOffset.scrollY,
-          rawX: sample.x,
-          rawY: sample.y
-        });
+          y: sample.y + viewportOffset.scrollY
+        }, '*');
       });
 
-      if (window.parent !== window) {
+      if (isInIframe) {
         window.parent.postMessage({ type: 'tracking-ready' }, '*');
       }
     }
 
+    var validating = false;
     window.addEventListener('message', function (event) {
-      var data = event.data;
+      var data = event.data || {};
       switch (data.type) {
         case 'start-tracking':
           isTracking = true;
-          gazeBuffer = [];
           break;
         case 'pause-tracking':
           isTracking = false;
-          if (window.parent !== window) {
-            window.parent.postMessage({
-              type: 'gaze-data-batch',
-              samples: gazeBuffer
-            }, '*');
-          }
           break;
         case 'viewport-update':
           viewportOffset.scrollX = data.scrollX || 0;
           viewportOffset.scrollY = data.scrollY || 0;
+          break;
+        case 'validate':                 // post-video accuracy (drift) check
+          if (validating) break;
+          validating = true;
+          (is_tracking_available ? measureAccuracy() : Promise.resolve(null)).then(function (res) {
+            validating = false;
+            window.parent.postMessage({ type: 'validation-result', result: res }, '*');
+          });
           break;
       }
     });
