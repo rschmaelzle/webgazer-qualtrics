@@ -31,7 +31,7 @@
 
   <script>
     // ------------------------------------------------------------------ settings
-    var MAX_ATTEMPTS = 3;        // calibrate up to this many times ...
+    var MAX_ATTEMPTS = 2;        // calibrate up to this many times ...
     var THRESHOLD = 0.08;        // ... until accuracy (RMSE / window diagonal) is at or below this
 
     // Accuracy check: same dots and procedure for the check after calibration and the
@@ -83,7 +83,7 @@
       var handler = function (s) { if (buffer) buffer.push(s); };
       sampleHandlers.push(handler);
 
-      var errors = [], nValid = [];
+      var errors = [], offsets = [], nValid = [];
       for (var i = 0; i < CHECK_POINTS.length; i++) {
         var p = CHECK_POINTS[i];
         dot.style.left = (p.x * 100) + '%';
@@ -98,8 +98,10 @@
           var dx = median(valid.map(function (s) { return s.x; })) - p.x * window.innerWidth;
           var dy = median(valid.map(function (s) { return s.y; })) - p.y * window.innerHeight;
           errors.push(Math.round(Math.sqrt(dx * dx + dy * dy)));
+          offsets.push([Math.round(dx), Math.round(dy)]);   // gaze minus dot: + = right / below
         } else {
           errors.push(null);                    // no face / too few samples at this dot
+          offsets.push(null);
         }
       }
 
@@ -115,6 +117,7 @@
         rmse: rmsePx === null ? null : rmsePx / diag,
         rmse_pixels: rmsePx === null ? null : Math.round(rmsePx),
         errors: errors,
+        offsets: offsets,
         n_samples: nValid,
         validation_points: CHECK_POINTS.length,
         measured_points: measured.length,
@@ -186,7 +189,7 @@
             <li><strong>Light on your face</strong> - no bright window or lamp behind you</li>
             <li>Sit about an arm's length from the screen, <strong>face centered</strong> in front of the camera</li>
             <li><strong>Keep your head still</strong> - move only your eyes; don't lean in or back</li>
-            <li>Maximize this browser window and <strong>stay on this tab</strong> until the video has ended</li>
+            <li><strong>Stay on this page</strong> until the video has ended - no other tabs or programs (e-mail, chat, phone)</li>
             <li>Glasses are fine; please avoid covering your face with your hands</li>
           </ul>
         </div>
@@ -225,8 +228,7 @@
             </p>
             <p style="color: #555; line-height: 1.6;">
               Please check that your face is well lit and centered, keep your head still,
-              and follow each dot with your eyes. Let's try again
-              (attempt ${calibration_attempts + 1} of ${MAX_ATTEMPTS}).
+              and follow each dot with your eyes. Let's try one more time.
             </p>
           </div>`;
       },
